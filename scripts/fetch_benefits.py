@@ -1,10 +1,15 @@
 """
-정부 혜택(보조금24) 데이터를 받아서 앱이 쓰기 좋은 파일 하나로 정리하는 프로그램.
+정부 혜택(보조금24) 데이터를 받아서 앱이 쓰기 좋은 파일로 정리하는 프로그램.
 
 - 데이터 출처: 행정안전부_대한민국 공공서비스(혜택) 정보 (공공데이터포털 15113968)
+  serviceList(목록) + serviceDetail(구비서류·온라인신청) + supportConditions(지원조건)
 - 인증키는 코드에 적지 않고, 환경변수 DATA_GO_KR_KEY 에서 읽어요.
-  (GitHub 에서는 Settings > Secrets 에 넣은 값이 자동으로 들어와요)
-- 결과 파일: data/benefits.json  (앱이 이 파일 하나만 내려받아요)
+- 결과는 public/ 폴더에 만들어지고, GitHub Pages 로 배포돼요.
+    public/index.json            : 갱신 시각, 지역 목록, 파일 목록(+변경 확인용 해시)
+    public/data/national.json    : 전국 대상 혜택
+    public/data/r/<번호>.json     : 시·도별 혜택 (내 지역 파일만 받으면 돼요)
+    public/search_dict.json      : 서술형 검색 사전 (search/ 폴더에서 복사)
+    public/privacy.html 등       : site/ 폴더의 페이지 (개인정보처리방침)
 
 파이썬 기본 기능만 사용하므로 따로 설치할 것이 없어요.
 """
@@ -17,11 +22,14 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime, timezone, timedelta
 import re
+import hashlib
+import shutil
 
 BASE_URL = "https://api.odcloud.kr/api/gov24/v3"
 PER_PAGE = 1000          # 한 번에 받을 개수 (최대치)
 MIN_EXPECTED = 3000      # 이보다 적게 받으면 뭔가 잘못된 것으로 보고 저장하지 않음
-OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "benefits.json")
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+OUT_DIR = os.path.join(ROOT, "public")
 
 
 # ---------------------------------------------------------------- API 호출
@@ -139,26 +147,42 @@ def parse_region(org_name, org_type, idx):
     return None, None, False                          # 지역을 알 수 없는 지방기관 → 제외
 
 
-def parse_conditions(cond):
-    """지원조건에서 성별·나이 범위를 뽑아요. 정보가 없으면 '제한 없음'으로 처리."""
-    if not cond:
-        return None, None, None
-    male = cond.get("JA0101") == "Y"
-    female = cond.get("JA0102") == "Y"
-    if male and not female:
-        gender = "M"
-    elif female and not male:
-        gender = "F"
-    else:
-        gender = None  # 둘 다 Y 이거나 둘 다 비어있으면 성별 제한 없음
+# ---------------------------------------------------------------- 지원조건 코드
+# 출처: 보조금24 supportConditions. 그룹 안은 '하나라도', 그룹끼리는 '모두' 만족해야 해요.
+INCOME_CODES = ["JA0201", "JA0202", "JA0203", "JA0204", "JA0205"]      # 중위소득 ~50 / ~75 / ~100 / ~200 / 200초과
+LIFE_CODES = ["JA0301", "JA0302", "JA0303", "JA0313", "JA0314", "JA0315", "JA0316", "JA0317",
+              "JA0318", "JA0319", "JA0320", "JA0326", "JA0327", "JA0328", "JA0329", "JA0330"]
+LIFE_NONE = "JA0322"        # '해당사항없음' 이 켜져 있으면 해당 상황이 없는 사람도 대상
+HOUSE_CODES = ["JA0401", "JA0402", "JA0403", "JA0404", "JA0411", "JA0412", "JA0413", "JA0414"]
+HOUSE_NONE = "JA0410"
 
-    age_min = to_int(cond.get("JA0110"))
-    age_max = to_int(cond.get("JA0111"))
+
+def _on(cond, code):
+    return str(cond.get(code) or "").strip().upper() == "Y"
+
+
+def parse_conditions(cond):
+    """지원조건 → (성별, 최소나이, 최대나이, 소득구간[], 생애상황[], 가구상황[])
+    목록이 비어 있으면 그 항목은 제한이 없다는 뜻이에요."""
+    if not cond:
+        return None, None, None, [], [], []
+    male, female = _on(cond, "JA0101"), _on(cond, "JA0102")
+    gender = "M" if male and not female else "F" if female and not male else None
+    age_min, age_max = to_int(cond.get("JA0110")), to_int(cond.get("JA0111"))
     if age_min is not None and age_min <= 0:
         age_min = None
-    if age_max is not None and age_max >= 100:  # 120, 200 같은 값은 '상한 없음'
+    if age_max is not None and age_max >= 100:
         age_max = None
-    return gender, age_min, age_max
+    inc = [c for c in INCOME_CODES if _on(cond, c)]
+    if len(inc) == len(INCOME_CODES):
+        inc = []                                  # 모든 구간이면 제한 없음
+    life = [] if _on(cond, LIFE_NONE) else [c for c in LIFE_CODES if _on(cond, c)]
+    house = [] if _on(cond, HOUSE_NONE) else [c for c in HOUSE_CODES if _on(cond, c)]
+    return gender, age_min, age_max, inc, life, house
+
+
+def short(code):
+    return code[2:]   # 'JA0302' → '0302' (파일 크기 절약)
 
 
 # ---------------------------------------------------------------- 신청 마감일
@@ -231,12 +255,46 @@ def deadline_end(text):
     return None
 
 
+# ---------------------------------------------------------------- 지원 금액
+_UNIT = {"억원": 100_000_000, "억": 100_000_000, "천만원": 10_000_000, "백만원": 1_000_000, "만원": 10_000, "천원": 1_000, "원": 1}
+_AMT = re.compile(r"(최대|월|연|1인당|1회|가구당|인당|1가구당|매월|연간)?\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(억\s*원|억|천\s*만\s*원|백\s*만\s*원|만\s*원|천\s*원|원)(?![가-힣]{0,1}%)")
+
+def amount(*texts):
+    """지원 내용 문장에서 '가장 큰 지원 금액'을 찾아 (원 단위 숫자, 보기 좋은 글) 로 돌려줘요."""
+    best = None
+    for text in texts:
+        if not text:
+            continue
+        for pre, num, unit in _AMT.findall(text):
+            try:
+                v = float(num.replace(",", "")) * _UNIT[unit.replace(" ", "")]
+            except ValueError:
+                continue
+            if v < 10_000 or v > 5_000_000_000:      # 1만원 미만·50억 초과는 금액으로 보지 않아요
+                continue
+            if best is None or v > best[0]:
+                best = (v, pre, num, unit)
+    if not best:
+        return None, None
+    v, pre, num, unit = best
+    v = int(v)
+    if v >= 100_000_000:
+        txt = f"{v / 100_000_000:g}억원"
+    elif v >= 10_000:
+        txt = f"{v // 10_000:,}만원"
+    else:
+        txt = f"{v:,}원"
+    lead = {"매월": "월", "연간": "연", "인당": "1인당", "1가구당": "가구당"}.get(pre, pre)
+    return v, (f"{lead} {txt}" if lead else txt)
+
+
 # ---------------------------------------------------------------- 메인
 CUTOFF = (datetime.now(timezone(timedelta(hours=9))).date() - timedelta(days=30)).isoformat()
 
 
-def build(services, conditions):
+def build(services, conditions, details=()):
     cond_by_id = {c.get("서비스ID"): c for c in conditions if c.get("서비스ID")}
+    det_by_id = {d.get("서비스ID"): d for d in details if d.get("서비스ID")}
     region_index = build_region_index(services)
     result = []
     for s in services:
@@ -246,21 +304,32 @@ def build(services, conditions):
         sido, sigungu, known = parse_region(s.get("소관기관명"), s.get("소관기관유형"), region_index)
         if not known:
             continue
-        gender, age_min, age_max = parse_conditions(cond_by_id.get(sid))
+        d = det_by_id.get(sid, {})
+        gender, age_min, age_max, inc, life, house = parse_conditions(cond_by_id.get(sid))
+        content = clean(d.get("지원내용")) or clean(s.get("지원내용"))
+        summary = clean(s.get("서비스목적요약"))
+        amt, amt_label = amount(content, summary)
+        online = clean(d.get("온라인신청사이트URL"))
+        if online and not re.match(r"^https?://", online):
+            online = None
         item = {
             "id": sid,
             "name": clean(s.get("서비스명")),
-            "summary": clean(s.get("서비스목적요약")),
+            "summary": summary,
             "field": clean(s.get("서비스분야")),
             "supportType": clean(s.get("지원유형")),
-            "target": clean(s.get("지원대상")),
-            "criteria": clean(s.get("선정기준")),
-            "content": clean(s.get("지원내용")),
-            "howToApply": clean(s.get("신청방법")),
-            "deadline": clean(s.get("신청기한")),
-            "endDate": deadline_end(s.get("신청기한")),  # 마감일 (모르면 없음) — 앱이 오늘 날짜와 비교해 숨겨요
-            "receiver": clean(s.get("접수기관")),
-            "phone": clean(s.get("전화문의")),
+            "target": clean(d.get("지원대상")) or clean(s.get("지원대상")),
+            "criteria": clean(d.get("선정기준")) or clean(s.get("선정기준")),
+            "content": content,
+            "howToApply": clean(d.get("신청방법")) or clean(s.get("신청방법")),
+            "deadline": clean(d.get("신청기한")) or clean(s.get("신청기한")),
+            "endDate": deadline_end(clean(d.get("신청기한")) or s.get("신청기한")),
+            "receiver": clean(d.get("접수기관명")) or clean(s.get("접수기관")),
+            "phone": clean(d.get("문의처")) or clean(s.get("전화문의")),
+            "docs": clean(d.get("구비서류")),
+            "docsOfficial": clean(d.get("공무원확인구비서류")),
+            "docsSelf": clean(d.get("본인확인필요구비서류")),
+            "onlineUrl": online,
             "org": clean(s.get("소관기관명")),
             "orgType": clean(s.get("소관기관유형")),
             "userType": clean(s.get("사용자구분")),
@@ -271,13 +340,71 @@ def build(services, conditions):
             "gender": gender,
             "ageMin": age_min,
             "ageMax": age_max,
+            "inc": [short(c) for c in inc] or None,
+            "life": [short(c) for c in life] or None,
+            "house": [short(c) for c in house] or None,
+            "amount": amt,
+            "amountLabel": amt_label,
         }
-        # 마감된 지 30일이 넘은 혜택은 아예 빼요 (최근 마감은 앱이 오늘 날짜로 다시 판단)
+        # 마감된 지 30일이 넘은 혜택은 빼요 (최근 마감은 앱이 오늘 날짜로 다시 판단)
         if item["endDate"] and item["endDate"] < CUTOFF:
             continue
-        # 빈 값은 빼서 파일 크기를 줄임
         result.append({k: v for k, v in item.items() if v is not None})
     return result
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(raw)
+    return hashlib.sha256(raw).hexdigest()[:16], len(raw)
+
+
+def publish(benefits, updated_at):
+    """시·도별로 나눠서 public/ 폴더에 저장해요."""
+    if os.path.isdir(OUT_DIR):
+        shutil.rmtree(OUT_DIR)
+    national = [b for b in benefits if "sido" not in b]
+    by_sido = {}
+    for b in benefits:
+        if "sido" in b:
+            by_sido.setdefault(b["sido"], []).append(b)
+    files, regions = {}, {}
+    h, size = write_json(os.path.join(OUT_DIR, "data", "national.json"), {"items": national})
+    files["전국"] = {"path": "data/national.json", "hash": h, "count": len(national), "bytes": size}
+    for n, sido in enumerate(sorted(by_sido), start=1):
+        items = sorted(by_sido[sido], key=lambda b: b["id"])
+        h, size = write_json(os.path.join(OUT_DIR, "data", "r", f"{n}.json"), {"items": items})
+        files[sido] = {"path": f"data/r/{n}.json", "hash": h, "count": len(items), "bytes": size}
+        regions[sido] = sorted({b["sigungu"] for b in items if "sigungu" in b})
+    # 서술형 검색 사전 (있으면 같이 배포 — 앱 업데이트 없이 사전을 고칠 수 있어요)
+    dict_src = os.path.join(ROOT, "search", "search_dict.json")
+    dict_info = None
+    if os.path.exists(dict_src):
+        with open(dict_src, encoding="utf-8") as f:
+            d = json.load(f)
+        h, size = write_json(os.path.join(OUT_DIR, "search_dict.json"), d)
+        dict_info = {"path": "search_dict.json", "hash": h, "version": d.get("version", 1)}
+    # 안내 페이지 (개인정보처리방침 등)
+    site_src = os.path.join(ROOT, "site")
+    if os.path.isdir(site_src):
+        for name in os.listdir(site_src):
+            shutil.copy(os.path.join(site_src, name), os.path.join(OUT_DIR, name))
+    index = {
+        "schema": 2,
+        "updatedAt": updated_at,
+        "source": "행정안전부_대한민국 공공서비스(혜택) 정보 (공공데이터포털)",
+        "sourceUrl": "https://www.data.go.kr/data/15113968/openapi.do",
+        "count": len(benefits),
+        "regions": regions,
+        "files": files,
+        "dict": dict_info,
+    }
+    write_json(os.path.join(OUT_DIR, "index.json"), index)
+    # 아무 폴더에서나 정적 파일이 그대로 보이도록
+    open(os.path.join(OUT_DIR, ".nojekyll"), "w").close()
+    return files
 
 
 def main():
@@ -289,27 +416,23 @@ def main():
     services = fetch_all("serviceList", key)
     print("2) 지원조건 받는 중...")
     conditions = fetch_all("supportConditions", key)
+    print("3) 상세정보(구비서류·온라인신청) 받는 중...")
+    try:
+        details = fetch_all("serviceDetail", key)
+    except Exception as e:   # 상세정보가 실패해도 목록만으로 계속 진행
+        print("  상세정보 실패, 목록 정보만 사용:", e)
+        details = []
 
-    benefits = build(services, conditions)
-    print(f"3) 정리 완료: {len(benefits)}건")
-
+    benefits = build(services, conditions, details)
+    print(f"4) 정리 완료: {len(benefits)}건")
     if len(benefits) < MIN_EXPECTED:
-        sys.exit(f"받은 데이터가 {len(benefits)}건밖에 안 돼서 저장하지 않았어요 "
-                 f"(기존 파일 유지). 인증키나 API 상태를 확인해 주세요.")
+        sys.exit(f"받은 데이터가 {len(benefits)}건밖에 안 돼서 배포하지 않았어요. 인증키나 API 상태를 확인해 주세요.")
 
     kst = timezone(timedelta(hours=9))
-    output = {
-        "updatedAt": datetime.now(kst).strftime("%Y-%m-%d %H:%M"),
-        "source": "행정안전부_대한민국 공공서비스(혜택) 정보 (공공데이터포털)",
-        "sourceUrl": "https://www.data.go.kr/data/15113968/openapi.do",
-        "count": len(benefits),
-        "items": sorted(benefits, key=lambda b: b["id"]),
-    }
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, separators=(",", ":"))
-    size_mb = os.path.getsize(OUTPUT_PATH) / 1024 / 1024
-    print(f"4) 저장 완료: data/benefits.json ({size_mb:.1f}MB)")
+    files = publish(benefits, datetime.now(kst).strftime("%Y-%m-%d %H:%M"))
+    for name, f in files.items():
+        print(f"   {name}: {f['count']}건 {f['bytes'] / 1024:.0f}KB")
+    print("5) public/ 폴더에 저장 완료")
 
 
 if __name__ == "__main__":
