@@ -75,24 +75,67 @@ def to_int(value):
         return None
 
 
-def parse_region(org_name, org_type):
-    """
-    소관기관명에서 지역을 뽑아요.
-    예) '서울특별시 강남구' -> ('서울특별시', '강남구')
-        '경기도'           -> ('경기도', None)
-        '보건복지부'        -> (None, None)  = 전국 대상
-    지자체가 아닌 기관(중앙부처·공공기관·교육청)은 전국 대상으로 봐요.
-    """
-    name = clean(org_name)
-    if not name or not (org_type and "지방자치단체" in org_type):
-        return None, None
+# 지역 판별
+# 정부 데이터의 '소관기관유형' 값: 시군구 / 광역시도 / 중앙행정기관 / 공공기관 /
+#   지방공기업 / 지방출자_출연기관 / 교육청
+# - 시군구: '서울특별시 강남구' → (서울특별시, 강남구)
+# - 광역시도: '경기도' → (경기도, 없음)
+# - 중앙행정기관·공공기관: 전국 대상
+# - 지방공기업·출연기관·교육청: 이름에서 지역을 찾아요 (예: '용산구시설관리공단' → 서울 용산구)
+#   지역을 못 찾으면 엉뚱한 지역에 보이지 않도록 목록에서 빼요.
+LOCAL_BODIES = ("지방공기업", "지방출자_출연기관", "교육청")
+
+def build_region_index(services):
+    """데이터 안의 지자체 이름으로 지역 사전을 만들어요 (시·도 이름이 바뀌어도 자동 대응)."""
+    sidos, sigungus = set(), {}
+    for s in services:
+        t, org = (s.get("소관기관유형") or "").strip(), (s.get("소관기관명") or "").strip()
+        parts = org.split()
+        if t == "광역시도" and parts:
+            sidos.add(parts[0])
+        elif t == "시군구" and len(parts) >= 2:
+            sidos.add(parts[0]); sigungus.setdefault(parts[0], set()).add(parts[1])
+    alias = {}
+    for sd in sidos:
+        names = {sd, sd[0] + sd[2] if sd[:2] in ("충청", "경상", "전라") else sd[:2]}
+        if "광주" in sd: names.add("광주")
+        for n in names: alias[n] = sd
+    # 시·군·구 짧은 이름(예: '시흥' → 경기도 시흥시). 여러 시·도에 같은 이름이 있으면 '?' 로 표시
+    stem = {}
+    for sd, gs in sigungus.items():
+        for g in gs:
+            for key in {g, g[:-1] if len(g) >= 3 else g}:
+                stem[key] = (sd, g) if key not in stem or stem[key] == (sd, g) else "?"
+    return alias, sigungus, stem
+
+def parse_region(org_name, org_type, idx):
+    alias, sigungus, stem = idx
+    name = (org_name or "").strip()
+    t = (org_type or "").strip()
     parts = name.split()
-    sido = parts[0]
-    sigungu = None
-    if len(parts) >= 2 and parts[1][-1:] in ("시", "군", "구"):
-        sigungu = parts[1]
-        # '수원시 장안구' 처럼 구가 한 번 더 있으면 '수원시'로 묶음
-    return sido, sigungu
+    if t == "광역시도" and parts:
+        return parts[0], None, True
+    if t == "시군구" and len(parts) >= 2:
+        return parts[0], parts[1], True
+    if t not in LOCAL_BODIES:
+        return None, None, True                      # 중앙부처·공공기관 = 전국
+    flat = name.replace("(재)", "").replace("재단법인", "").replace(" ", "")
+    sido = next((alias[a] for a in sorted(alias, key=len, reverse=True) if flat.startswith(a)), None)
+    rest = flat
+    if sido:
+        a = next(a for a in sorted(alias, key=len, reverse=True) if flat.startswith(a))
+        rest = flat[len(sido):] if flat.startswith(sido) else flat[len(a):]
+    gu = None
+    for key in sorted(stem, key=len, reverse=True):
+        if len(key) >= 2 and rest.startswith(key):
+            v = stem[key]
+            if sido and key in {g for g in sigungus.get(sido, ())} | {g[:-1] for g in sigungus.get(sido, ()) if len(g) >= 3}:
+                gu = next(g for g in sigungus[sido] if g == key or g[:-1] == key); break
+            if not sido and v != "?":
+                sido, gu = v; break
+    if sido:
+        return sido, gu, True
+    return None, None, False                          # 지역을 알 수 없는 지방기관 → 제외
 
 
 def parse_conditions(cond):
@@ -120,12 +163,15 @@ def parse_conditions(cond):
 # ---------------------------------------------------------------- 메인
 def build(services, conditions):
     cond_by_id = {c.get("서비스ID"): c for c in conditions if c.get("서비스ID")}
+    region_index = build_region_index(services)
     result = []
     for s in services:
         sid = clean(s.get("서비스ID"))
         if not sid:
             continue
-        sido, sigungu = parse_region(s.get("소관기관명"), s.get("소관기관유형"))
+        sido, sigungu, known = parse_region(s.get("소관기관명"), s.get("소관기관유형"), region_index)
+        if not known:
+            continue
         gender, age_min, age_max = parse_conditions(cond_by_id.get(sid))
         item = {
             "id": sid,
