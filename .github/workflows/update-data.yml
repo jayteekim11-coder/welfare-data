@@ -1,0 +1,38 @@
+# 매일 새벽 자동으로 정부 혜택 데이터를 받아 data/benefits.json 을 갱신해요.
+name: 혜택 데이터 갱신
+
+on:
+  schedule:
+    - cron: "37 18 * * *"   # 매일 한국시간 새벽 3시 37분 (UTC 18:37)
+  workflow_dispatch:         # Actions 화면에서 [Run workflow] 버튼으로 바로 실행도 가능
+
+permissions:
+  contents: write            # 갱신된 파일을 저장소에 저장하기 위한 권한
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 데이터 받기
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+        run: python scripts/fetch_benefits.py
+
+      - name: 바뀐 내용이 있으면 저장
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/benefits.json
+          if git diff --cached --quiet; then
+            echo "바뀐 내용 없음"
+          else
+            git commit -m "혜택 데이터 갱신 $(TZ=Asia/Seoul date +'%Y-%m-%d')"
+            git push
+          fi
