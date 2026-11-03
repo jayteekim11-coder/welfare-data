@@ -15,7 +15,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
+import re
 
 BASE_URL = "https://api.odcloud.kr/api/gov24/v3"
 PER_PAGE = 1000          # 한 번에 받을 개수 (최대치)
@@ -160,7 +161,80 @@ def parse_conditions(cond):
     return gender, age_min, age_max
 
 
+# ---------------------------------------------------------------- 신청 마감일
+# 연·월·일이 모두 있는 날짜: 2026.04.06 / 2026-4-6 / 2026. 4. 6. / 2026년 4월 6일 / '26.4.6
+_FULL = re.compile(
+    r"(?<![\d.])(20\d{2}|'\d{2}|\d{2}(?=\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}))\s*[.\-/년]\s*"
+    r"(\d{1,2})\s*[.\-/월]\s*(\d{1,2})(?!\d)(?!\s*일?\s*기준)"
+)
+# 연도 없는 월·일: 12.31 / 4월 24일
+_MD = re.compile(r"(?<![\d.])(\d{1,2})\s*[.월]\s*(\d{1,2})(?![\d:])")
+
+
+def _year(y):
+    y = int(y.lstrip("'"))
+    return y + 2000 if y < 100 else y
+
+
+def _full_dates(text):
+    out = []
+    for y, m, d in _FULL.findall(text):
+        try:
+            out.append(date(_year(y), int(m), int(d)))
+        except ValueError:
+            pass
+    return out
+
+
+def deadline_end(text):
+    """
+    신청기한 문장에서 '마감일'을 찾아 YYYY-MM-DD 로 돌려줘요.
+    마감일을 확실히 알 수 없으면 None (= 마감 여부 판단하지 않고 계속 보여줌).
+      '2026.03.04 ~ 2026.04.06'   → 2026-04-06
+      "'26.7.1.~12.31."           → 2026-12-31 (끝 날짜에 연도가 없으면 앞 날짜의 연도 사용)
+      '2026.3.3.~ 자금 소진 시'     → None (끝이 정해지지 않음)
+      '2026.5.31.까지'             → 2026-05-31
+      '상시신청', '매년 3월'        → None
+    """
+    if not text:
+        return None
+    t = text.replace("～", "~").replace("〜", "~")
+    # '하반기 미정', '추후 공고', '매년' 처럼 다음 모집이 남아 있을 수 있으면 마감으로 보지 않아요
+    if re.search(r"미정|추후|예정|별도\s*공고|매년|매월|연중|상시|수시", t):
+        return None
+
+    if "~" in t:
+        head, tail = t.rsplit("~", 1)
+        tail_full = _full_dates(tail)
+        if tail_full:
+            return max(tail_full).isoformat()
+        md = _MD.search(tail)
+        head_full = _full_dates(head)
+        if md and head_full:
+            start = max(head_full)
+            try:
+                end = date(start.year, int(md.group(1)), int(md.group(2)))
+            except ValueError:
+                return None
+            if end < start:
+                end = date(start.year + 1, end.month, end.day)
+            return end.isoformat()
+        return None  # '~' 뒤에 날짜가 없으면 끝이 열려 있는 것
+
+    if "까지" in t:
+        found = _full_dates(t.split("까지")[0])
+        return max(found).isoformat() if found else None
+
+    found = _full_dates(t)
+    if len(found) == 1 and len(t.strip()) <= 20:   # 날짜 하나만 달랑 적힌 경우 = 마감일
+        return found[0].isoformat()
+    return None
+
+
 # ---------------------------------------------------------------- 메인
+CUTOFF = (datetime.now(timezone(timedelta(hours=9))).date() - timedelta(days=30)).isoformat()
+
+
 def build(services, conditions):
     cond_by_id = {c.get("서비스ID"): c for c in conditions if c.get("서비스ID")}
     region_index = build_region_index(services)
@@ -184,6 +258,7 @@ def build(services, conditions):
             "content": clean(s.get("지원내용")),
             "howToApply": clean(s.get("신청방법")),
             "deadline": clean(s.get("신청기한")),
+            "endDate": deadline_end(s.get("신청기한")),  # 마감일 (모르면 없음) — 앱이 오늘 날짜와 비교해 숨겨요
             "receiver": clean(s.get("접수기관")),
             "phone": clean(s.get("전화문의")),
             "org": clean(s.get("소관기관명")),
@@ -197,6 +272,9 @@ def build(services, conditions):
             "ageMin": age_min,
             "ageMax": age_max,
         }
+        # 마감된 지 30일이 넘은 혜택은 아예 빼요 (최근 마감은 앱이 오늘 날짜로 다시 판단)
+        if item["endDate"] and item["endDate"] < CUTOFF:
+            continue
         # 빈 값은 빼서 파일 크기를 줄임
         result.append({k: v for k, v in item.items() if v is not None})
     return result
